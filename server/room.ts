@@ -16,6 +16,7 @@ import {
 import twitch from "twitch-m3u8";
 import { type QueryResult } from "pg";
 import { Docker } from "./vm/docker.ts";
+import { extractUploadIds, deleteUpload } from "./utils/uploads.ts";
 
 // Stateless pool instance to use for VMs if full management isn't needed
 let stateless: Docker | undefined = undefined;
@@ -57,6 +58,12 @@ export class Room {
 
   // Non-serialized state
   public roomId: string;
+  // True for postgres-backed rooms that persist across restarts; their uploaded
+  // files must survive being freed from memory. Temporary rooms clean up on close.
+  public permanent = false;
+  // Ids of files uploaded via Upload & Play/Convert and played in this room,
+  // tracked so we can delete them when they're no longer needed.
+  private uploadedFileIds = new Set<string>();
   public roster: User[] = [];
   private lastTsMap = Date.now();
   private tsMap: NumberDict = {};
@@ -448,6 +455,25 @@ export class Room {
     if (this.tsInterval) {
       clearInterval(this.tsInterval);
     }
+    // Clean up uploaded files when a temporary room is freed from memory.
+    // Permanent (postgres-backed) rooms keep their uploads so they still play
+    // after the room is reloaded.
+    if (!this.permanent) {
+      for (const id of this.uploadedFileIds) {
+        deleteUpload(id);
+      }
+    }
+    this.uploadedFileIds.clear();
+  };
+
+  // Delete every uploaded file this room owns, including its current video.
+  // Used when a room is explicitly deleted (applies even to permanent rooms).
+  public cleanupUploads = () => {
+    extractUploadIds(this.video).forEach((id) => this.uploadedFileIds.add(id));
+    for (const id of this.uploadedFileIds) {
+      deleteUpload(id);
+    }
+    this.uploadedFileIds.clear();
   };
 
   public getRosterForStats = () => {
@@ -537,6 +563,17 @@ export class Room {
     if (data && data.length > 50000) {
       return;
     }
+    // Track uploaded files so we can clean them up, and delete any we're
+    // switching away from (no longer referenced by this room).
+    const prevUploadIds = extractUploadIds(this.video);
+    const nextUploadIds = extractUploadIds(data);
+    nextUploadIds.forEach((id) => this.uploadedFileIds.add(id));
+    prevUploadIds.forEach((id) => {
+      if (!nextUploadIds.includes(id)) {
+        this.uploadedFileIds.delete(id);
+        deleteUpload(id);
+      }
+    });
     this.video = data;
     this.videoTS = 0;
     this.paused = false;

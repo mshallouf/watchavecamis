@@ -69,6 +69,31 @@ This project supports creating virtual browsers (using https://github.com/m1k1o/
 - Note: If your web client is not running on the same physical machine as the server, you will also need to configure `DOCKER_VM_HOST` to a publically-resolvable value (i.e. not localhost)
 - If you want to run managed instance pools (whether on cloud or with Docker), configure `VM_MANAGER_CONFIG` and run the vmWorker service.
 
+### Sharing your own files (Upload & Play / Upload & Convert)
+
+The "File" button offers two server-side ways to share a local file that stay in
+sync for everyone and work for long videos (unlike live Fileshare, which
+re-encodes to WebRTC and can black-screen viewers on large/long movies):
+
+- **Upload & Play** — uploads the file to this server and plays it for everyone
+  as a normal synced video URL. Best for browser-playable files (MP4/H.264/AAC).
+- **Upload & Convert** — uploads the file, then transcodes it to HLS
+  (H.264/AAC) with ffmpeg so formats browsers can't play directly (MKV, HEVC,
+  AC3/DTS, etc.) also work. Streams that are already H.264/AAC are copied (fast);
+  everything else is re-encoded. Playback starts once the first segments are
+  ready.
+
+Config (all optional):
+
+- `UPLOAD_DIRECTORY` — where uploaded files and generated HLS are stored/served
+  (default `uploads`, served at `/uploads`). This directory is gitignored.
+- `UPLOAD_MAX_BYTES` — max size of an uploaded file in bytes (`0` = unlimited).
+- `FFMPEG_PATH` / `FFPROBE_PATH` — override the binaries. Empty = use the
+  bundled `ffmpeg-static` / `ffprobe-static` binaries (no manual install needed).
+
+For friends on other networks to reach uploaded files, the server must be
+reachable at a public address (see hosting/`VITE_SERVER_HOST`).
+
 ### Room Persistence
 
 - Configure Postgres by adding DATABASE_URL to your .env file and then setting up the database schema

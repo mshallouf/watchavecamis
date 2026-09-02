@@ -1,5 +1,15 @@
 declare module "srt-webvtt";
 
+declare module "ffmpeg-static" {
+  const ffmpegPath: string | null;
+  export default ffmpegPath;
+}
+
+declare module "ffprobe-static" {
+  const ffprobe: { path: string };
+  export default ffprobe;
+}
+
 type StringDict = Record<string, string>;
 type NumberDict = Record<string, number>;
 type BooleanDict = Record<string, boolean>;
