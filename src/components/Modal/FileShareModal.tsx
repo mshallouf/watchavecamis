@@ -7,6 +7,8 @@ export const FileShareModal = (props: {
   closeModal: () => void;
   startFileShare: (useMediaSoup: boolean) => void;
   startConvert: () => void;
+  startUpload: () => void;
+  startUploadConvert: () => void;
 }) => {
   const context = useContext(MetadataContext);
   const { closeModal } = props;
@@ -19,7 +21,48 @@ export const FileShareModal = (props: {
       size="auto"
       centered
     >
-      <div>You're about to share a file from your device.</div>
+      <div
+        style={{
+          marginBottom: 12,
+          padding: 12,
+          border: "1px solid #4caf50",
+          borderRadius: 6,
+        }}
+      >
+        <div style={{ fontWeight: 600, marginBottom: 4 }}>
+          Recommended for long movies: Upload &amp; Play
+        </div>
+        <div style={{ marginBottom: 8, fontSize: 13 }}>
+          Uploads the file to the server once, then plays it for everyone in
+          sync. Works reliably for long files (no black screen for viewers).
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <Button
+            color="green"
+            onClick={() => {
+              props.startUpload();
+              props.closeModal();
+            }}
+          >
+            Upload &amp; Play (MP4)
+          </Button>
+          <Button
+            color="teal"
+            onClick={() => {
+              props.startUploadConvert();
+              props.closeModal();
+            }}
+          >
+            Upload &amp; Convert (MKV / any format)
+          </Button>
+        </div>
+        <div style={{ marginTop: 6, fontSize: 12, opacity: 0.75 }}>
+          Use <b>Play</b> for MP4 files (fastest). Use <b>Convert</b> for MKV,
+          HEVC, or anything that won't play directly &mdash; the server
+          re-encodes it first, so playback starts after a short wait.
+        </div>
+      </div>
+      <div>Or share your video live from your device:</div>
       <Table striped>
         <Table.Thead>
           <Table.Tr>

@@ -27,6 +27,12 @@ import { gzipSync } from "node:zlib";
 import { resolveShard } from "./utils/resolveShard.ts";
 import { makeRoomName, makeUserName } from "./utils/moniker.ts";
 import { getStats } from "./utils/getStats.ts";
+import {
+  hasFfmpeg,
+  probeCodecs,
+  startHlsTranscode,
+} from "./utils/ffmpeg.ts";
+import { uploadDir, ensureUploadDir } from "./utils/uploads.ts";
 
 if (process.env.NODE_ENV === "development") {
   axios.interceptors.request.use(
@@ -78,6 +84,8 @@ io.engine.use(async (req: any, res: Response, next: () => void) => {
       : undefined;
     if (data) {
       const room = new Room(io, key, data);
+      // Loaded from postgres, so its uploads must persist across memory unloads
+      room.permanent = true;
       rooms.set(key, room);
       console.log(
         "loading room %s into memory on shard %s",
@@ -296,6 +304,8 @@ app.post("/createRoom", async (req, res) => {
   let name = genName();
   console.log("createRoom: ", name);
   const newRoom = new Room(io, name);
+  // With postgres, rooms persist between restarts, so keep their uploads too
+  newRoom.permanent = Boolean(postgres);
   if (postgres) {
     const now = new Date();
     const roomObj = {
@@ -492,6 +502,8 @@ app.delete("/deleteRoom", async (req, res) => {
     `DELETE from room WHERE owner = $1 and "roomId" = $2`,
     [decoded.uid, req.query.roomId],
   );
+  // Also remove any uploaded files owned by this room
+  rooms.get(String(req.query.roomId))?.cleanupUploads();
   res.json(result?.rows);
 });
 
@@ -641,6 +653,138 @@ app.get("/proxy/*splat", async (req, res) => {
     // console.log(e);
     console.log("proxy failed: %s", req.url);
   }
+});
+
+// "Upload & Play": accept a local file from the host, store it, and serve it
+// back as a normal HTTP video URL. Everyone in the room then plays the same
+// URL with the built-in play/pause/seek sync, so long files work reliably
+// without the live re-encoding that black-screens viewers on big movies.
+ensureUploadDir();
+// Without postgres, no room survives a restart, so any leftover uploads are
+// orphans from a previous run — clear them for disk hygiene. With postgres,
+// persisted rooms may still reference their uploads, so we leave them alone.
+if (!postgres) {
+  try {
+    for (const entry of fs.readdirSync(uploadDir)) {
+      fs.rmSync(path.join(uploadDir, entry), { recursive: true, force: true });
+    }
+  } catch (e) {
+    console.error("failed to clear orphaned uploads", e);
+  }
+}
+// Serve uploaded files (and generated HLS playlists/segments) with Range
+// support so viewers can seek.
+app.use(
+  "/uploads",
+  express.static(uploadDir, {
+    acceptRanges: true,
+    fallthrough: false,
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith(".m3u8")) {
+        res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+        // The playlist grows while transcoding, so it must not be cached
+        res.setHeader("Cache-Control", "no-cache");
+      } else if (filePath.endsWith(".ts")) {
+        res.setHeader("Content-Type", "video/mp2t");
+      }
+    },
+  }),
+);
+// Chunked upload endpoint for both "Upload & Play" (mode=play) and
+// "Upload & Convert" (mode=convert). The client sends the file in ordered
+// chunks so each request stays small — this keeps big movies working even
+// through proxies that cap request bodies (e.g. Cloudflare's free 100 MB
+// limit). The client picks a random 16-hex `id` and reuses it for every chunk.
+app.post("/uploadChunk", (req, res) => {
+  const id = String(req.query.id || "");
+  if (!/^[a-f0-9]{16}$/.test(id)) {
+    res.status(400).json({ error: "Invalid upload id" });
+    return;
+  }
+  const mode = req.query.mode === "convert" ? "convert" : "play";
+  const index = Number(req.query.index) || 0;
+  const isLast = String(req.query.last) === "1";
+  if (mode === "convert" && index === 0 && !hasFfmpeg()) {
+    res.status(501).json({
+      error: "Video conversion is not available on this server (ffmpeg missing)",
+    });
+    return;
+  }
+  // Sanitize the filename; keep only the basename and safe characters
+  const rawName = String(req.query.name || "video").split(/[\\/]/).pop() || "video";
+  const safeName =
+    rawName.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-100) || "video";
+  const ext =
+    path.extname(safeName).match(/^\.[a-zA-Z0-9]{1,5}$/)?.[0] ||
+    (mode === "convert" ? ".mkv" : "");
+  const destDir = path.join(uploadDir, id);
+  // Convert keeps the raw upload as source.<ext>; play serves the file directly
+  const fileName = mode === "convert" ? "source" + ext : safeName;
+  const destPath = path.join(destDir, fileName);
+  const cleanup = () => {
+    try {
+      fs.rmSync(destDir, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  };
+  try {
+    fs.mkdirSync(destDir, { recursive: true });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to prepare upload" });
+    return;
+  }
+  // First chunk starts a fresh file; later chunks append in order
+  const ws = fs.createWriteStream(destPath, { flags: index === 0 ? "w" : "a" });
+  req.on("aborted", () => {
+    ws.destroy();
+  });
+  ws.on("error", () => {
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Failed to write file" });
+    }
+  });
+  ws.on("finish", async () => {
+    const maxBytes = Number(config.UPLOAD_MAX_BYTES) || 0;
+    if (maxBytes) {
+      try {
+        if (fs.statSync(destPath).size > maxBytes) {
+          cleanup();
+          if (!res.headersSent) {
+            res
+              .status(413)
+              .json({ error: "File is larger than the allowed limit" });
+          }
+          return;
+        }
+      } catch {
+        // ignore stat errors
+      }
+    }
+    if (!isLast) {
+      res.json({ ok: true });
+      return;
+    }
+    // Final chunk: finalize the upload
+    if (mode === "convert") {
+      try {
+        const codecs = await probeCodecs(destPath);
+        startHlsTranscode(destPath, destDir, codecs);
+        redisCount("fileConverts");
+        res.json({ url: "/uploads/" + id + "/index.m3u8" });
+      } catch (e) {
+        console.error("convert failed", e);
+        cleanup();
+        if (!res.headersSent) {
+          res.status(500).json({ error: "Failed to start conversion" });
+        }
+      }
+    } else {
+      redisCount("fileUploads");
+      res.json({ url: "/uploads/" + id + "/" + encodeURIComponent(safeName) });
+    }
+  });
+  req.pipe(ws);
 });
 
 app.use(express.static(config.BUILD_DIRECTORY));

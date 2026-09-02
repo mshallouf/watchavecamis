@@ -154,6 +154,7 @@ interface AppState {
   roomId: string;
   errorMessage: string;
   successMessage: string;
+  isConverting: boolean;
   warningMessage: string;
   isChatDisabled: boolean;
   showChatColumn: boolean;
@@ -224,6 +225,7 @@ export class App extends React.Component<AppProps, AppState> {
     savedPasswords: {},
     errorMessage: "",
     successMessage: "",
+    isConverting: false,
     warningMessage: "",
     isChatDisabled: false,
     showChatColumn: isMobile()
@@ -1107,6 +1109,153 @@ export class App extends React.Component<AppProps, AppState> {
     //   //@ts-expect-error
     //   duplex: 'half',
     // });
+  };
+
+  // Upload the selected local file to our own server in ordered chunks, with
+  // progress reporting. Chunking keeps each request small so big movies upload
+  // even through proxies that cap request bodies (e.g. Cloudflare's free
+  // 100 MB limit). Resolves with the server URL of the stored/generated media,
+  // or undefined if cancelled or failed. `mode` is "play" (serve the file
+  // directly) or "convert" (transcode to HLS first).
+  private uploadToServer = async (
+    mode: "play" | "convert",
+  ): Promise<string | undefined> => {
+    const files = await openFileSelector();
+    if (!files) {
+      return undefined;
+    }
+    const file = files[0];
+    // 25 MB chunks — comfortably under the 100 MB proxy cap, small enough for
+    // smooth progress and cheap retries.
+    const CHUNK_SIZE = 25 * 1024 * 1024;
+    // Random 16-hex id shared by every chunk of this upload
+    const id = Array.from(crypto.getRandomValues(new Uint8Array(8)))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    const total = file.size;
+    const controller = new AbortController();
+    const start = Date.now();
+    this.setState({
+      uploadController: controller,
+      downloaded: 0,
+      total,
+      speed: 0,
+      connections: 1,
+    });
+    let uploaded = 0;
+    let finalUrl: string | undefined;
+    try {
+      let index = 0;
+      for (let offset = 0; offset === 0 || offset < total; offset += CHUNK_SIZE) {
+        const chunk = file.slice(offset, offset + CHUNK_SIZE);
+        const isLast = offset + CHUNK_SIZE >= total;
+        const url =
+          serverPath +
+          "/uploadChunk?id=" +
+          id +
+          "&name=" +
+          encodeURIComponent(file.name) +
+          "&index=" +
+          index +
+          "&last=" +
+          (isLast ? "1" : "0") +
+          "&mode=" +
+          mode;
+        const resp = await fetch(url, {
+          method: "POST",
+          body: chunk,
+          headers: { "Content-Type": "application/octet-stream" },
+          signal: controller.signal,
+        });
+        if (!resp.ok) {
+          let msg = "Upload failed";
+          try {
+            msg = (await resp.json()).error || msg;
+          } catch {
+            // ignore
+          }
+          throw new Error(msg);
+        }
+        uploaded += chunk.size;
+        const end = Date.now();
+        this.setState({
+          downloaded: uploaded,
+          total,
+          speed: uploaded / ((end - start) / 1000),
+          connections: 1,
+        });
+        if (isLast) {
+          const data = await resp.json();
+          finalUrl = data.url;
+          break;
+        }
+        index += 1;
+      }
+      return finalUrl;
+    } catch (e) {
+      if ((e as Error).name !== "AbortError") {
+        this.setState({ errorMessage: (e as Error).message || "Upload failed" });
+        setTimeout(() => this.setState({ errorMessage: "" }), 5000);
+      }
+      return undefined;
+    } finally {
+      this.setState({
+        uploadController: undefined,
+        downloaded: 0,
+        total: 0,
+        speed: 0,
+      });
+    }
+  };
+
+  // Upload a local file and play it for everyone via the normal synced-URL
+  // flow. Unlike Fileshare (which live re-encodes into a WebRTC stream and
+  // black-screens viewers on large/long movies), this just serves the file
+  // over HTTP, so length is a non-issue. Best for browser-playable files
+  // (e.g. MP4/H.264/AAC).
+  startUpload = async () => {
+    const url = await this.uploadToServer("play");
+    if (url) {
+      // Store an absolute URL so every viewer loads it from our server
+      this.roomSetMedia(serverPath + url);
+    }
+  };
+
+  // Upload a local file and transcode it to HLS on the server so formats
+  // browsers can't play directly (MKV, HEVC, etc.) still work for everyone.
+  // Playback starts once the first HLS segments are ready.
+  startUploadConvert = async () => {
+    const url = await this.uploadToServer("convert");
+    if (!url) {
+      return;
+    }
+    const playlistUrl = serverPath + url;
+    this.setState({ isConverting: true });
+    // Poll the playlist until it has at least one segment, then play it
+    let ready = false;
+    for (let i = 0; i < 60 && !ready; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      try {
+        const resp = await fetch(playlistUrl, { cache: "no-store" });
+        if (resp.ok) {
+          const text = await resp.text();
+          if (text.includes(".ts")) {
+            ready = true;
+          }
+        }
+      } catch {
+        // keep polling
+      }
+    }
+    this.setState({ isConverting: false });
+    if (ready) {
+      this.roomSetMedia(playlistUrl);
+    } else {
+      this.setState({
+        errorMessage: "Conversion is taking too long or failed",
+      });
+      setTimeout(() => this.setState({ errorMessage: "" }), 5000);
+    }
   };
 
   startFileShare = async (useMediaSoup: boolean) => {
@@ -2056,6 +2205,8 @@ export class App extends React.Component<AppProps, AppState> {
             closeModal={() => this.setState({ isFileShareModalOpen: false })}
             startFileShare={this.startFileShare}
             startConvert={this.startConvert}
+            startUpload={this.startUpload}
+            startUploadConvert={this.startUploadConvert}
           />
         )}
         {this.state.isSubtitleModalOpen && (
@@ -2115,6 +2266,21 @@ export class App extends React.Component<AppProps, AppState> {
             }}
           >
             {this.state.errorMessage}
+          </Alert>
+        )}
+        {this.state.isConverting && (
+          <Alert
+            title="Converting video"
+            color="blue"
+            style={{
+              position: "fixed",
+              bottom: "10px",
+              right: "10px",
+              zIndex: 1000,
+            }}
+          >
+            Converting your file for playback. This can take a moment for long
+            videos&hellip;
           </Alert>
         )}
         {this.state.successMessage && (
@@ -2346,7 +2512,7 @@ export class App extends React.Component<AppProps, AppState> {
                           }}
                           leftSection={<IconX />}
                         >
-                          Stop Convert
+                          Stop
                         </Button>
                       )}
                       {false && (

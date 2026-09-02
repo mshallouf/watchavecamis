@@ -47,6 +47,10 @@ const defaults = {
   ROOM_CAPACITY: 0, // Maximum capacity of a standard room. Set to 0 for unlimited.
   ROOM_CAPACITY_SUB: 0, // Maximum capacity of a sub room. Set to 0 for unlimited.
   BUILD_DIRECTORY: "build", // Name of the directory where the built React UI is served from
+  UPLOAD_DIRECTORY: "uploads", // Directory where files uploaded via "Upload & Play" are stored and served from
+  UPLOAD_MAX_BYTES: 0, // Max size (bytes) for an uploaded file. 0 = unlimited
+  FFMPEG_PATH: "", // Path to ffmpeg binary. Empty = use the bundled ffmpeg-static binary
+  FFPROBE_PATH: "", // Path to ffprobe binary. Empty = use the bundled ffprobe-static binary
   VM_MIN_UPTIME_MINUTES: 0, // Number of minutes of the hour VMs must exist for before being eligible for termination
   SHARD: undefined, // Shard ID of the web server (configure in ecosystem.config.js)
   FREE_ROOM_LIMIT: 1, // The maximum number of rooms a free user can have
